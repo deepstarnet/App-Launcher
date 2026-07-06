@@ -1,258 +1,287 @@
-import os
 import sys
-import pickle
-import time
+import os
+import json
+import gi
 
-try:
-    import gi
-    gi.require_version('Gtk', '4.0')
-    gi.require_version('Gio', '2.0')
-    from gi.repository import Gtk, Gdk, Gio, GLib
-except Exception as e:
-    print(f"Missing dependencies: {e}")
-    sys.exit(1)
+gi.require_version('Gtk', '4.0')
+from gi.repository import Gtk, Gdk, Gio, GObject
 
-WINDOW_WIDTH  = 850
+USAGE_FILE = os.path.expanduser("~/.cache/usage.json")
+
+WINDOW_WIDTH = 850
 WINDOW_HEIGHT = 400
-TOP_OFFSET    = 120
-CACHE_FILE    = os.path.expanduser("~/.cache/launcher-apps.pkl")
-CACHE_TTL     = 300  # секунд (5 минут)
+
+COLORS = {
+    "bg": "#0a0a0f",
+    "text": "#e0e0e0",
+    "muted": "#5a5a66",
+    "accent_1": "#00ff9f",
+    "accent_2": "#00e5ff",
+    "panel": "#0e0e14",
+    "border": "#1c1c24",
+}
 
 
-def get_applications(use_cache=True):
-    # Проверяем кэш
-    if use_cache and os.path.exists(CACHE_FILE):
-        age = time.time() - os.path.getmtime(CACHE_FILE)
-        if age < CACHE_TTL:
-            with open(CACHE_FILE, 'rb') as f:
-                return pickle.load(f)
+def load_usage():
+    try:
+        with open(USAGE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
+
+def save_usage(usage):
+    os.makedirs(os.path.dirname(USAGE_FILE), exist_ok=True)
+    with open(USAGE_FILE, "w", encoding="utf-8") as f:
+        json.dump(usage, f)
+
+
+class AppItem(GObject.Object):
+    __gtype_name__ = 'AppItem'
+
+    def __init__(self, name, app_info):
+        super().__init__()
+        self.name = name
+        self.app_info = app_info
+        self.icon = app_info.get_icon()
+        self.app_id = app_info.get_id() or name
+
+
+def get_all_apps():
     apps = []
-    seen = set()
     for app in Gio.AppInfo.get_all():
-        if not app.should_show():
-            continue
-        name = app.get_name()
-        if name in seen:
-            continue
-        seen.add(name)
-        apps.append((name, app.get_id()))
-
-    apps = sorted(apps, key=lambda x: x[0].lower())
-
-    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-    with open(CACHE_FILE, 'wb') as f:
-        pickle.dump(apps, f)
-
+        if app.should_show():
+            apps.append(AppItem(app.get_name(), app))
     return apps
-
-
-def launch_app(app_id):
-    app_info = Gio.DesktopAppInfo.new(app_id)
-    if app_info:
-        app_info.launch([], None)
 
 
 class LauncherWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app)
 
-        self.all_apps = get_applications()
-        self.filtered = self.all_apps[:]
-
         self.set_decorated(False)
         self.set_resizable(False)
         self.set_default_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.set_size_request(WINDOW_WIDTH, WINDOW_HEIGHT)
 
-        self._build_ui()
         self._apply_css()
 
-        key_ctrl = Gtk.EventControllerKey()
-        key_ctrl.connect('key-pressed', self._on_key)
-        self.add_controller(key_ctrl)
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        main_box.add_css_class("main-box")
+        self.set_child(main_box)
 
-    def _build_ui(self):
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.set_child(outer)
+        # --- search entry ---
+        self.entry = Gtk.SearchEntry(placeholder_text="Search...")
+        self.entry.add_css_class("search-entry")
+        self.entry.set_margin_start(10)
+        self.entry.set_margin_end(10)
+        self.entry.set_margin_top(10)
+        self.entry.set_margin_bottom(6)
+        self.entry.connect("search-changed", self._on_search_changed)
+        self.entry.connect("activate", self._on_entry_activate)
+        main_box.append(self.entry)
 
-        self.entry = Gtk.Entry()
-        self.entry.set_placeholder_text("Search applications...")
-        self.entry.add_css_class('search-entry')
-        self.entry.set_margin_top(12)
-        self.entry.set_margin_bottom(8)
-        self.entry.set_margin_start(12)
-        self.entry.set_margin_end(12)
-        self.entry.connect('changed', self._on_search)
-        self.entry.connect('activate', self._on_enter)
-        outer.append(self.entry)
+        # --- data: base store -> filter -> sorter (optional) -> selection ---
+        self.usage = load_usage()
+        self.store = Gio.ListStore(item_type=AppItem)
+        for app_item in get_all_apps():
+            self.store.append(app_item)
+        self._sort_store_by_usage()
 
-        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        sep.add_css_class('sep')
-        outer.append(sep)
+        self.filter = Gtk.CustomFilter.new(self._filter_func, None)
+        self.filter_model = Gtk.FilterListModel(model=self.store, filter=self.filter)
 
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_vexpand(True)
-        scroll.set_margin_top(4)
-        scroll.set_margin_bottom(8)
+        self.selection = Gtk.SingleSelection(model=self.filter_model)
 
-        self.listbox = Gtk.ListBox()
-        self.listbox.add_css_class('app-list')
-        self.listbox.set_selection_mode(Gtk.SelectionMode.BROWSE)
-        self.listbox.connect('row-activated', self._on_activate)
-        scroll.set_child(self.listbox)
-        outer.append(scroll)
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", self._setup_item)
+        factory.connect("bind", self._bind_item)
 
-        self._populate_list(self.all_apps)
-        GLib.idle_add(self._select_first)
+        self.list_view = Gtk.ListView(model=self.selection, factory=factory)
+        self.list_view.add_css_class("app-list")
+        self.list_view.connect("activate", self._on_activate)
 
-    def _populate_list(self, apps):
-        while True:
-            row = self.listbox.get_row_at_index(0)
-            if row is None:
-                break
-            self.listbox.remove(row)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_vexpand(True)
+        scroller.set_child(self.list_view)
+        main_box.append(scroller)
 
-        for name, app_id in apps:
-            row = Gtk.ListBoxRow()
-            row.app_id = app_id
-            row.add_css_class('app-row')
-            label = Gtk.Label(label=name)
-            label.set_halign(Gtk.Align.START)
-            label.set_margin_start(16)
-            label.set_margin_top(8)
-            label.set_margin_bottom(8)
-            label.add_css_class('app-label')
-            row.set_child(label)
-            self.listbox.append(row)
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect('key-pressed', self._on_key_pressed)
+        self.add_controller(key_controller)
 
-    def _select_first(self):
-        row = self.listbox.get_row_at_index(0)
-        if row:
-            self.listbox.select_row(row)
-        return False
+        self.connect("close-request", self._on_close_request)
 
-    def _on_search(self, entry):
-        query = entry.get_text().lower().strip()
+        # focus search on open, select first row by default
+        self.entry.grab_focus()
+        if self.filter_model.get_n_items() > 0:
+            self.selection.set_selected(0)
+
+    # ---------- usage / sorting ----------
+    def _sort_store_by_usage(self):
+        def compare(a, b, _data):
+            count_a = self.usage.get(a.app_id, 0)
+            count_b = self.usage.get(b.app_id, 0)
+            if count_a != count_b:
+                return -1 if count_a > count_b else 1
+            return -1 if a.name.lower() < b.name.lower() else (1 if a.name.lower() > b.name.lower() else 0)
+        self.store.sort(compare, None)
+
+    def _bump_usage(self, app_item):
+        self.usage[app_item.app_id] = self.usage.get(app_item.app_id, 0) + 1
+        save_usage(self.usage)
+        self._sort_store_by_usage()
+
+    # ---------- filtering ----------
+    def _filter_func(self, item, user_data):
+        query = self.entry.get_text().strip().lower()
         if not query:
-            self.filtered = self.all_apps[:]
-        else:
-            self.filtered = [
-                (name, app_id) for name, app_id in self.all_apps
-                if query in name.lower()
-            ]
-        self._populate_list(self.filtered)
-        GLib.idle_add(self._select_first)
+            return True
+        return query in item.name.lower()
 
-    def _on_enter(self, entry):
-        row = self.listbox.get_selected_row()
-        if row:
-            launch_app(row.app_id)
-            self.close()
+    def _on_search_changed(self, entry):
+        self.filter.changed(Gtk.FilterChange.DIFFERENT)
+        if self.filter_model.get_n_items() > 0:
+            self.selection.set_selected(0)
 
-    def _on_activate(self, listbox, row):
-        launch_app(row.app_id)
-        self.close()
+    # ---------- launching ----------
+    def _on_close_request(self, *_args):
+        self.set_visible(False)
+        return True  # отменяем стандартный destroy
 
-    def _on_key(self, ctrl, keyval, keycode, state):
+    def _on_activate(self, list_view, position):
+        app_item = self.filter_model.get_item(position)
+        if app_item is None:
+            return
+        try:
+            app_item.app_info.launch()
+            self._bump_usage(app_item)
+        finally:
+            self.set_visible(False)
+
+    def _on_entry_activate(self, entry):
+        # срабатывает на Enter прямо в поле поиска — Entry сама "съедает"
+        # это событие, поэтому ловим его тут, а не в key-controller'е окна
+        self._launch_selected()
+
+    def _launch_selected(self):
+        position = self.selection.get_selected()
+        if position == Gtk.INVALID_LIST_POSITION:
+            return
+        self._on_activate(self.list_view, position)
+
+    # ---------- keyboard ----------
+    NUM_KEYS = {
+        Gdk.KEY_1: 0, Gdk.KEY_2: 1, Gdk.KEY_3: 2, Gdk.KEY_4: 3, Gdk.KEY_5: 4,
+        Gdk.KEY_6: 5, Gdk.KEY_7: 6, Gdk.KEY_8: 7, Gdk.KEY_9: 8,
+    }
+
+    def _on_key_pressed(self, controller, keyval, keycode, state):
         if keyval == Gdk.KEY_Escape:
-            self.close()
-        elif keyval == Gdk.KEY_Down:
-            self._move_selection(1)
-        elif keyval == Gdk.KEY_Up:
-            self._move_selection(-1)
-        elif keyval == Gdk.KEY_Return:
-            row = self.listbox.get_selected_row()
-            if row:
-                launch_app(row.app_id)
-                self.close()
+            self.set_visible(False)
+            return True
+        if state & Gdk.ModifierType.ALT_MASK and keyval in self.NUM_KEYS:
+            index = self.NUM_KEYS[keyval]
+            if index < self.filter_model.get_n_items():
+                self._on_activate(self.list_view, index)
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self._launch_selected()
+            return True
+        if keyval == Gdk.KEY_Down:
+            pos = self.selection.get_selected()
+            n = self.filter_model.get_n_items()
+            if n > 0:
+                self.selection.set_selected(min(pos + 1, n - 1) if pos != Gtk.INVALID_LIST_POSITION else 0)
+            return True
+        if keyval == Gdk.KEY_Up:
+            pos = self.selection.get_selected()
+            if pos != Gtk.INVALID_LIST_POSITION and pos > 0:
+                self.selection.set_selected(pos - 1)
+            return True
         return False
 
-    def _move_selection(self, direction):
-        current = self.listbox.get_selected_row()
-        if current is None:
-            self._select_first()
-            return
-        idx      = current.get_index()
-        next_row = self.listbox.get_row_at_index(idx + direction)
-        if next_row:
-            self.listbox.select_row(next_row)
-            next_row.grab_focus()
+    # ---------- list item factory ----------
+    def _setup_item(self, factory, list_item):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.set_margin_start(10)
+        box.set_margin_top(4)
+        box.set_margin_bottom(4)
+        icon = Gtk.Image()
+        icon.set_pixel_size(24)
+        label = Gtk.Label(xalign=0)
+        box.append(icon)
+        box.append(label)
+        # keep direct references instead of relying on observe_children() order
+        box.icon = icon
+        box.label = label
+        list_item.set_child(box)
 
+    def _bind_item(self, factory, list_item):
+        app_item = list_item.get_item()
+        box = list_item.get_child()
+        box.icon.set_from_gicon(app_item.icon)
+        box.label.set_text(app_item.name)
+
+    # ---------- styling ----------
     def _apply_css(self):
-        css = b"""
-        window {
-            background-color: rgba(10, 10, 15, 0.97);
-            border: 1px solid rgba(0, 229, 255, 0.3);
-            border-radius: 10px;
-        }
-        .search-entry {
-            font-family: JetBrains Mono, monospace;
-            font-size: 14px;
+        css = f"""
+        window {{
+            background-color: {COLORS['bg']};
+            border: 1px solid {COLORS['border']};
+            border-radius: 20px;
+            color: {COLORS['text']};
+        }}
+        .main-box {{
+            border-radius: 20px;
+        }}
+        .search-entry {{
+            color: {COLORS['text']};
+            background-color: {COLORS['panel']};
+            border: 1px solid {COLORS['border']};
+            padding: 8px;
+            border-radius: 16px;
+        }}
+        listview {{
             background-color: transparent;
-            border: none;
-            border-bottom: 1px solid rgba(0, 229, 255, 0.15);
-            border-radius: 0;
-            color: #e8e8ec;
-            caret-color: #00e5ff;
-            padding: 6px 4px;
-            box-shadow: none;
-        }
-        .search-entry:focus {
-            outline: none;
-            box-shadow: none;
-            border-bottom-color: rgba(0, 229, 255, 0.6);
-        }
-        .sep {
-            background-color: rgba(0, 229, 255, 0.1);
-            min-height: 1px;
-        }
-        .app-list {
-            background: transparent;
-        }
-        .app-row {
-            background: transparent;
-            border-radius: 4px;
-            margin: 1px 8px;
-        }
-        .app-row:selected {
-            background-color: rgba(0, 229, 255, 0.1);
-        }
-        .app-row:selected .app-label {
-            color: #00e5ff;
-        }
-        .app-label {
-            font-family: JetBrains Mono, monospace;
-            font-size: 13px;
-            color: #9a9aaa;
-        }
-        scrollbar {
-            background: transparent;
-            min-width: 4px;
-        }
-        scrollbar slider {
-            background-color: rgba(0, 229, 255, 0.2);
-            border-radius: 4px;
-            min-height: 30px;
-        }
+            padding: 5px;
+        }}
+        listview row {{
+            padding: 10px;
+            color: {COLORS['text']};
+            border-radius: 10px;
+        }}
+        listview row:selected {{
+            background-color: rgba(0, 255, 159, 0.1);
+            border-left: 2px solid {COLORS['accent_1']};
+            color: #ffffff;
+        }}
+        listview row:hover {{
+            background-color: rgba(0, 229, 255, 0.06);
+        }}
         """
         provider = Gtk.CssProvider()
-        provider.load_from_data(css)
+        provider.load_from_data(css.encode())
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(),
             provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
 
 class LauncherApp(Gtk.Application):
     def __init__(self):
         super().__init__(application_id='dev.deepstar.launcher')
+        self.win = None
 
     def do_activate(self):
-        win = LauncherWindow(self)
-        win.present()
-        win.entry.grab_focus()
+        if self.win is None:
+            self.win = LauncherWindow(self)
+        else:
+            self.win.entry.set_text("")
+            self.win.selection.set_selected(0)
+        self.win.entry.grab_focus()
+        self.win.present()
 
 
 if __name__ == '__main__':
