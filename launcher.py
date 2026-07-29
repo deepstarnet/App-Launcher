@@ -8,9 +8,10 @@ from gi.repository import Gtk, Gdk, Gio, GObject
 
 USAGE_FILE = os.path.expanduser("~/.cache/usage.json")
 
-WINDOW_WIDTH = 850
+WINDOW_WIDTH  = 850
 WINDOW_HEIGHT = 400
 
+# will be separate file
 COLORS = {
     "bg": "#0a0a0f",
     "text": "#e0e0e0",
@@ -70,7 +71,7 @@ class LauncherWindow(Gtk.ApplicationWindow):
         main_box.add_css_class("main-box")
         self.set_child(main_box)
 
-        # --- search entry ---
+        # search 
         self.entry = Gtk.SearchEntry(placeholder_text="Search...")
         self.entry.add_css_class("search-entry")
         self.entry.set_margin_start(10)
@@ -81,7 +82,7 @@ class LauncherWindow(Gtk.ApplicationWindow):
         self.entry.connect("activate", self._on_entry_activate)
         main_box.append(self.entry)
 
-        # --- data: base store -> filter -> sorter (optional) -> selection ---
+        #  data: base store -> filter -> sorter (optional) -> selection
         self.usage = load_usage()
         self.store = Gio.ListStore(item_type=AppItem)
         for app_item in get_all_apps():
@@ -100,6 +101,7 @@ class LauncherWindow(Gtk.ApplicationWindow):
         self.list_view = Gtk.ListView(model=self.selection, factory=factory)
         self.list_view.add_css_class("app-list")
         self.list_view.connect("activate", self._on_activate)
+        self.list_view.set_single_click_activate(True)
 
         scroller = Gtk.ScrolledWindow()
         scroller.set_vexpand(True)
@@ -117,7 +119,7 @@ class LauncherWindow(Gtk.ApplicationWindow):
         if self.filter_model.get_n_items() > 0:
             self.selection.set_selected(0)
 
-    # ---------- usage / sorting ----------
+    # usage / sorting
     def _sort_store_by_usage(self):
         def compare(a, b, _data):
             count_a = self.usage.get(a.app_id, 0)
@@ -132,7 +134,7 @@ class LauncherWindow(Gtk.ApplicationWindow):
         save_usage(self.usage)
         self._sort_store_by_usage()
 
-    # ---------- filtering ----------
+    # filing
     def _filter_func(self, item, user_data):
         query = self.entry.get_text().strip().lower()
         if not query:
@@ -143,6 +145,8 @@ class LauncherWindow(Gtk.ApplicationWindow):
         self.filter.changed(Gtk.FilterChange.DIFFERENT)
         if self.filter_model.get_n_items() > 0:
             self.selection.set_selected(0)
+        else:
+            self.selection.set_selected(Gtk.INVALID_LIST_POSITION)
 
     # ---------- launching ----------
     def _on_close_request(self, *_args):
@@ -154,14 +158,15 @@ class LauncherWindow(Gtk.ApplicationWindow):
         if app_item is None:
             return
         try:
-            app_item.app_info.launch()
+            context = Gdk.Display.get_default().get_app_launch_context()
+            app_item.app_info.launcher([], context)
             self._bump_usage(app_item)
+        except Exeption as e:
+            print(f"Failed to launch {app_item.name}: {e}")
         finally:
             self.set_visible(False)
-
     def _on_entry_activate(self, entry):
-        # срабатывает на Enter прямо в поле поиска — Entry сама "съедает"
-        # это событие, поэтому ловим его тут, а не в key-controller'е окна
+        
         self._launch_selected()
 
     def _launch_selected(self):
@@ -170,7 +175,7 @@ class LauncherWindow(Gtk.ApplicationWindow):
             return
         self._on_activate(self.list_view, position)
 
-    # ---------- keyboard ----------
+    # keyboard
     NUM_KEYS = {
         Gdk.KEY_1: 0, Gdk.KEY_2: 1, Gdk.KEY_3: 2, Gdk.KEY_4: 3, Gdk.KEY_5: 4,
         Gdk.KEY_6: 5, Gdk.KEY_7: 6, Gdk.KEY_8: 7, Gdk.KEY_9: 8,
@@ -201,7 +206,7 @@ class LauncherWindow(Gtk.ApplicationWindow):
             return True
         return False
 
-    # ---------- list item factory ----------
+    # -list item
     def _setup_item(self, factory, list_item):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         box.set_margin_start(10)
@@ -223,7 +228,7 @@ class LauncherWindow(Gtk.ApplicationWindow):
         box.icon.set_from_gicon(app_item.icon)
         box.label.set_text(app_item.name)
 
-    # ---------- styling ----------
+    # styling (in the future will be a separate file)
     def _apply_css(self):
         css = f"""
         window {{
