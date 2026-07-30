@@ -159,12 +159,13 @@ class LauncherWindow(Gtk.ApplicationWindow):
             return
         try:
             context = Gdk.Display.get_default().get_app_launch_context()
-            app_item.app_info.launcher([], context)
+            app_item.app_info.launch(None, context)
             self._bump_usage(app_item)
-        except Exeption as e:
+        except Exception as e:
             print(f"Failed to launch {app_item.name}: {e}")
         finally:
             self.set_visible(False)
+
     def _on_entry_activate(self, entry):
         
         self._launch_selected()
