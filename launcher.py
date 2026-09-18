@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import re
 import gi
 
 gi.require_version('Gtk', '4.0')
@@ -9,18 +10,21 @@ from gi.repository import Gtk, Gdk, Gio, GObject
 USAGE_FILE = os.path.expanduser("~/.cache/usage.json")
 
 WINDOW_WIDTH  = 850
-WINDOW_HEIGHT = 400
+WINDOW_HEIGHT = 800
 
-# will be separate file
 COLORS = {
     "bg": "#0a0a0f",
     "text": "#e0e0e0",
     "muted": "#5a5a66",
-    "accent_1": "#00ff9f",
-    "accent_2": "#00e5ff",
+    "accent_1": "#ff2d55",   # neon red
+    "accent_2": "#00e5ff",   # cyan
     "panel": "#0e0e14",
     "border": "#1c1c24",
+    "glow_red": "rgba(255, 45, 85, 0.15)",
+    "glow_cyan": "rgba(0, 229, 255, 0.15)",
 }
+
+CALC_PATTERN = re.compile(r'^[\d\s\+\-\*\/\.\(\)%]+$')
 
 
 def load_usage():
@@ -37,6 +41,51 @@ def save_usage(usage):
         json.dump(usage, f)
 
 
+def fuzzy_score(query, text):
+    """
+    Fuzzy matcher: возвращает score > 0 если все символы query
+    встречаются в text по порядку, иначе 0. Компактнее совпадение
+    и ближе к началу строки = выше score.
+    """
+    query = query.lower()
+    text = text.lower()
+
+    if not query:
+        return 1
+
+    if query in text:
+        idx = text.index(query)
+        return 1000 - idx
+
+    t_idx = 0
+    match_positions = []
+    for ch in query:
+        found_at = text.find(ch, t_idx)
+        if found_at == -1:
+            return 0
+        match_positions.append(found_at)
+        t_idx = found_at + 1
+
+    if not match_positions:
+        return 0
+
+    span = match_positions[-1] - match_positions[0] + 1
+    return max(1, 500 - span * 5)
+
+
+def safe_eval_calc(expr):
+    """Безопасное вычисление арифметики без произвольного eval."""
+    if not CALC_PATTERN.match(expr):
+        return None
+    try:
+        result = eval(expr, {"__builtins__": {}}, {})
+        if isinstance(result, (int, float)):
+            return result
+    except Exception:
+        return None
+    return None
+
+
 class AppItem(GObject.Object):
     __gtype_name__ = 'AppItem'
 
@@ -46,6 +95,7 @@ class AppItem(GObject.Object):
         self.app_info = app_info
         self.icon = app_info.get_icon()
         self.app_id = app_info.get_id() or name
+        self.score = 0
 
 
 def get_all_apps():
@@ -65,24 +115,33 @@ class LauncherWindow(Gtk.ApplicationWindow):
         self.set_default_size(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.set_size_request(WINDOW_WIDTH, WINDOW_HEIGHT)
 
+        self.add_css_class("launcher")
+
         self._apply_css()
 
-        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        main_box.add_css_class("main-box")
-        self.set_child(main_box)
+        self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.main_box.add_css_class("main-box")
+        self.set_child(self.main_box)
 
-        # search 
-        self.entry = Gtk.SearchEntry(placeholder_text="Search...")
+        # Обычный GtkEntry вместо GtkSearchEntry — меньше системных
+        # Adwaita-биндингов, проще перебить кастомным CSS
+        self.entry = Gtk.Entry(placeholder_text="Search or calculate...")
         self.entry.add_css_class("search-entry")
         self.entry.set_margin_start(10)
         self.entry.set_margin_end(10)
         self.entry.set_margin_top(10)
         self.entry.set_margin_bottom(6)
-        self.entry.connect("search-changed", self._on_search_changed)
+        self.entry.connect("changed", self._on_search_changed)
         self.entry.connect("activate", self._on_entry_activate)
-        main_box.append(self.entry)
+        self.main_box.append(self.entry)
 
-        #  data: base store -> filter -> sorter (optional) -> selection
+        self.calc_label = Gtk.Label(xalign=0)
+        self.calc_label.add_css_class("calc-result")
+        self.calc_label.set_margin_start(14)
+        self.calc_label.set_margin_bottom(4)
+        self.calc_label.set_visible(False)
+        self.main_box.append(self.calc_label)
+
         self.usage = load_usage()
         self.store = Gio.ListStore(item_type=AppItem)
         for app_item in get_all_apps():
@@ -92,7 +151,10 @@ class LauncherWindow(Gtk.ApplicationWindow):
         self.filter = Gtk.CustomFilter.new(self._filter_func, None)
         self.filter_model = Gtk.FilterListModel(model=self.store, filter=self.filter)
 
-        self.selection = Gtk.SingleSelection(model=self.filter_model)
+        self.sorter = Gtk.CustomSorter.new(self._sort_func, None)
+        self.sort_model = Gtk.SortListModel(model=self.filter_model, sorter=self.sorter)
+
+        self.selection = Gtk.SingleSelection(model=self.sort_model)
 
         factory = Gtk.SignalListItemFactory()
         factory.connect("setup", self._setup_item)
@@ -103,10 +165,10 @@ class LauncherWindow(Gtk.ApplicationWindow):
         self.list_view.connect("activate", self._on_activate)
         self.list_view.set_single_click_activate(True)
 
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_vexpand(True)
-        scroller.set_child(self.list_view)
-        main_box.append(scroller)
+        self.scroller = Gtk.ScrolledWindow()
+        self.scroller.set_vexpand(True)
+        self.scroller.set_child(self.list_view)
+        self.main_box.append(self.scroller)
 
         key_controller = Gtk.EventControllerKey()
         key_controller.connect('key-pressed', self._on_key_pressed)
@@ -114,12 +176,10 @@ class LauncherWindow(Gtk.ApplicationWindow):
 
         self.connect("close-request", self._on_close_request)
 
-        # focus search on open, select first row by default
         self.entry.grab_focus()
-        if self.filter_model.get_n_items() > 0:
+        if self.sort_model.get_n_items() > 0:
             self.selection.set_selected(0)
 
-    # usage / sorting
     def _sort_store_by_usage(self):
         def compare(a, b, _data):
             count_a = self.usage.get(a.app_id, 0)
@@ -134,27 +194,58 @@ class LauncherWindow(Gtk.ApplicationWindow):
         save_usage(self.usage)
         self._sort_store_by_usage()
 
-    # filing
     def _filter_func(self, item, user_data):
-        query = self.entry.get_text().strip().lower()
+        query = self.entry.get_text().strip()
         if not query:
+            item.score = 0
             return True
-        return query in item.name.lower()
+        score = fuzzy_score(query, item.name)
+        item.score = score
+        return score > 0
+
+    def _sort_func(self, a, b, user_data):
+        query = self.entry.get_text().strip()
+        if not query:
+            return 0
+        if a.score != b.score:
+            return -1 if a.score > b.score else 1
+        return 0
 
     def _on_search_changed(self, entry):
+        query = entry.get_text().strip()
+
+        calc_result = None
+        if query and any(op in query for op in "+-*/%") and CALC_PATTERN.match(query):
+            calc_result = safe_eval_calc(query)
+
+        if calc_result is not None:
+            self.calc_label.set_text(f"= {calc_result}")
+            self.calc_label.set_visible(True)
+        else:
+            self.calc_label.set_visible(False)
+
         self.filter.changed(Gtk.FilterChange.DIFFERENT)
-        if self.filter_model.get_n_items() > 0:
+        self.sorter.changed(Gtk.SorterChange.DIFFERENT)
+
+        if self.sort_model.get_n_items() > 0:
             self.selection.set_selected(0)
         else:
             self.selection.set_selected(Gtk.INVALID_LIST_POSITION)
 
-    # ---------- launching ----------
     def _on_close_request(self, *_args):
         self.set_visible(False)
-        return True  # отменяем стандартный destroy
+        return True
+
+    def _copy_calc_result(self):
+        text = self.calc_label.get_text()
+        if text.startswith("= "):
+            value = text[2:]
+            clipboard = Gdk.Display.get_default().get_clipboard()
+            clipboard.set(value)
+            self.set_visible(False)
 
     def _on_activate(self, list_view, position):
-        app_item = self.filter_model.get_item(position)
+        app_item = self.sort_model.get_item(position)
         if app_item is None:
             return
         try:
@@ -167,7 +258,9 @@ class LauncherWindow(Gtk.ApplicationWindow):
             self.set_visible(False)
 
     def _on_entry_activate(self, entry):
-        
+        if self.calc_label.get_visible():
+            self._copy_calc_result()
+            return
         self._launch_selected()
 
     def _launch_selected(self):
@@ -176,7 +269,6 @@ class LauncherWindow(Gtk.ApplicationWindow):
             return
         self._on_activate(self.list_view, position)
 
-    # keyboard
     NUM_KEYS = {
         Gdk.KEY_1: 0, Gdk.KEY_2: 1, Gdk.KEY_3: 2, Gdk.KEY_4: 3, Gdk.KEY_5: 4,
         Gdk.KEY_6: 5, Gdk.KEY_7: 6, Gdk.KEY_8: 7, Gdk.KEY_9: 8,
@@ -188,15 +280,15 @@ class LauncherWindow(Gtk.ApplicationWindow):
             return True
         if state & Gdk.ModifierType.ALT_MASK and keyval in self.NUM_KEYS:
             index = self.NUM_KEYS[keyval]
-            if index < self.filter_model.get_n_items():
+            if index < self.sort_model.get_n_items():
                 self._on_activate(self.list_view, index)
             return True
         if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-            self._launch_selected()
+            self._on_entry_activate(self.entry)
             return True
         if keyval == Gdk.KEY_Down:
             pos = self.selection.get_selected()
-            n = self.filter_model.get_n_items()
+            n = self.sort_model.get_n_items()
             if n > 0:
                 self.selection.set_selected(min(pos + 1, n - 1) if pos != Gtk.INVALID_LIST_POSITION else 0)
             return True
@@ -207,7 +299,6 @@ class LauncherWindow(Gtk.ApplicationWindow):
             return True
         return False
 
-    # -list item
     def _setup_item(self, factory, list_item):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         box.set_margin_start(10)
@@ -218,7 +309,6 @@ class LauncherWindow(Gtk.ApplicationWindow):
         label = Gtk.Label(xalign=0)
         box.append(icon)
         box.append(label)
-        # keep direct references instead of relying on observe_children() order
         box.icon = icon
         box.label = label
         list_item.set_child(box)
@@ -226,52 +316,98 @@ class LauncherWindow(Gtk.ApplicationWindow):
     def _bind_item(self, factory, list_item):
         app_item = list_item.get_item()
         box = list_item.get_child()
-        box.icon.set_from_gicon(app_item.icon)
+
+        if app_item.icon:
+            box.icon.set_from_gicon(app_item.icon)
+        else:
+            box.icon.set_from_icon_name("application-x-executable")
+
         box.label.set_text(app_item.name)
 
-    # styling (in the future will be a separate file)
     def _apply_css(self):
+        # Против Adwaita: бьём по внутренним нодам (.search-entry text),
+        # используем обычный GtkEntry, PRIORITY_USER + !important
         css = f"""
-        window {{
-            background-color: {COLORS['bg']};
-            border: 1px solid {COLORS['border']};
-            border-radius: 20px;
-            color: {COLORS['text']};
+        window.launcher {{
+            background-color: {COLORS['bg']} !important;
+            border: 1px solid {COLORS['accent_2']};
+            border-radius: 4px;
+            color: {COLORS['text']} !important;
         }}
-        .main-box {{
-            border-radius: 20px;
-        }}
-        .search-entry {{
-            color: {COLORS['text']};
-            background-color: {COLORS['panel']};
-            border: 1px solid {COLORS['border']};
-            padding: 8px;
-            border-radius: 16px;
-        }}
-        listview {{
+
+        window.launcher .main-box {{
             background-color: transparent;
+        }}
+
+        window.launcher .search-entry,
+        window.launcher .search-entry text {{
+            color: {COLORS['accent_2']} !important;
+            background-color: {COLORS['panel']} !important;
+            border: 1px solid {COLORS['accent_1']};
+            border-radius: 2px;
+            font-family: monospace;
+            caret-color: {COLORS['accent_1']} !important;
+        }}
+
+        window.launcher .search-entry {{
+            padding: 10px;
+        }}
+
+        window.launcher .search-entry:focus-within {{
+            border: 1px solid {COLORS['accent_2']};
+            box-shadow: 0 0 8px {COLORS['glow_cyan']};
+        }}
+
+        window.launcher .calc-result {{
+            color: {COLORS['accent_1']} !important;
+            font-family: monospace;
+            font-weight: bold;
+            font-size: 14px;
+        }}
+
+        window.launcher listview,
+        window.launcher scrolledwindow {{
+            background-color: transparent !important;
             padding: 5px;
         }}
-        listview row {{
+
+        window.launcher listview row {{
             padding: 10px;
-            color: {COLORS['text']};
-            border-radius: 10px;
+            color: {COLORS['text']} !important;
+            border-left: 2px solid transparent;
+            border-radius: 2px;
+            background-color: transparent !important;
         }}
-        listview row:selected {{
-            background-color: rgba(0, 255, 159, 0.1);
+
+        window.launcher listview row label {{
+            color: {COLORS['text']} !important;
+        }}
+
+        window.launcher listview row:selected {{
+            background-color: {COLORS['glow_red']} !important;
             border-left: 2px solid {COLORS['accent_1']};
-            color: #ffffff;
         }}
-        listview row:hover {{
-            background-color: rgba(0, 229, 255, 0.06);
+
+        window.launcher listview row:selected label {{
+            color: #ffffff !important;
+        }}
+
+        window.launcher listview row:hover {{
+            background-color: {COLORS['glow_cyan']} !important;
+            border-left: 2px solid {COLORS['accent_2']};
         }}
         """
         provider = Gtk.CssProvider()
-        provider.load_from_data(css.encode())
+        try:
+            provider.load_from_string(css)
+        except Exception as e:
+            print(f"[CSS ERROR] Failed to parse stylesheet: {e}")
+            return
+
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(),
             provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            Gtk.STYLE_PROVIDER_PRIORITY_USER,
         )
 
 
@@ -285,11 +421,17 @@ class LauncherApp(Gtk.Application):
             self.win = LauncherWindow(self)
         else:
             self.win.entry.set_text("")
-            self.win.selection.set_selected(0)
+            self.win.calc_label.set_visible(False)
+            if self.win.sort_model.get_n_items() > 0:
+                self.win.selection.set_selected(0)
+            self.win.set_visible(True)
+
         self.win.entry.grab_focus()
         self.win.present()
 
 
 if __name__ == '__main__':
+    os.environ.setdefault("GTK_THEME", "Adwaita:dark")
+
     app = LauncherApp()
     app.run(sys.argv)
