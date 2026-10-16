@@ -10,7 +10,7 @@ from gi.repository import Gtk, Gdk, Gio, GObject
 USAGE_FILE = os.path.expanduser("~/.cache/usage.json")
 
 WINDOW_WIDTH  = 850
-WINDOW_HEIGHT = 800
+WINDOW_HEIGHT = 400
 
 COLORS = {
     "bg": "#0a0a0f",
@@ -325,14 +325,11 @@ class LauncherWindow(Gtk.ApplicationWindow):
         box.label.set_text(app_item.name)
 
     def _apply_css(self):
-        # Против Adwaita: бьём по внутренним нодам (.search-entry text),
-        # используем обычный GtkEntry, PRIORITY_USER + !important
         css = f"""
         window.launcher {{
-            background-color: {COLORS['bg']} !important;
-            border: 1px solid {COLORS['accent_2']};
+            background-color: {COLORS['bg']};
             border-radius: 4px;
-            color: {COLORS['text']} !important;
+            color: {COLORS['text']};
         }}
 
         window.launcher .main-box {{
@@ -341,12 +338,12 @@ class LauncherWindow(Gtk.ApplicationWindow):
 
         window.launcher .search-entry,
         window.launcher .search-entry text {{
-            color: {COLORS['accent_2']} !important;
-            background-color: {COLORS['panel']} !important;
+            color: {COLORS['accent_2']};
+            background-color: {COLORS['panel']};
             border: 1px solid {COLORS['accent_1']};
             border-radius: 2px;
             font-family: monospace;
-            caret-color: {COLORS['accent_1']} !important;
+            caret-color: {COLORS['accent_1']};
         }}
 
         window.launcher .search-entry {{
@@ -359,7 +356,7 @@ class LauncherWindow(Gtk.ApplicationWindow):
         }}
 
         window.launcher .calc-result {{
-            color: {COLORS['accent_1']} !important;
+            color: {COLORS['accent_1']};
             font-family: monospace;
             font-weight: bold;
             font-size: 14px;
@@ -367,33 +364,33 @@ class LauncherWindow(Gtk.ApplicationWindow):
 
         window.launcher listview,
         window.launcher scrolledwindow {{
-            background-color: transparent !important;
+            background-color: transparent;
             padding: 5px;
         }}
 
         window.launcher listview row {{
             padding: 10px;
-            color: {COLORS['text']} !important;
+            color: {COLORS['text']};
             border-left: 2px solid transparent;
             border-radius: 2px;
-            background-color: transparent !important;
+            background-color: transparent;
         }}
 
         window.launcher listview row label {{
-            color: {COLORS['text']} !important;
+            color: {COLORS['text']};
         }}
 
         window.launcher listview row:selected {{
-            background-color: {COLORS['glow_red']} !important;
+            background-color: {COLORS['glow_red']};
             border-left: 2px solid {COLORS['accent_1']};
         }}
 
         window.launcher listview row:selected label {{
-            color: #ffffff !important;
+            color: #ffffff;
         }}
 
         window.launcher listview row:hover {{
-            background-color: {COLORS['glow_cyan']} !important;
+            background-color: {COLORS['glow_cyan']};
             border-left: 2px solid {COLORS['accent_2']};
         }}
         """
